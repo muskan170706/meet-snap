@@ -1,20 +1,23 @@
 /**
- * MeetSnap v1.0.2 - Google Meet Camera Stream Interceptor with Clap Detection
+ * MeetSnap v1.0.4 - Google Meet Camera Stream Interceptor with Speech-Filtered Clap Detection & Disintegration Effect
  * Injected in MAIN world at document_start.
  */
 
 // ==================== Tunable Configuration ====================
-// Threshold for volume spike (currentVolume - rollingAverage) to detect a clap
-const THRESHOLD = 0.05;
+// Clap Detection vs Speech Filtering
+const THRESHOLD = 0.14;           // Volume spike above rolling average (speech is typically < 0.08)
+const MIN_VOLUME = 0.10;          // Minimum absolute volume required to consider a clap
+const HIGH_FREQ_RATIO = 0.50;     // Minimum ratio of high-freq energy (>2.5kHz) to low-freq energy (<1.5kHz). Speech is <0.3, claps are >0.7.
+const COOLDOWN = 1000;            // Cooldown in ms between claps (1 second)
+const ROLLING_AVG_ALPHA = 0.05;   // Rolling average smoothing factor
 
-// Cooldown period in milliseconds to prevent double firing
-const COOLDOWN = 1000;
-
-// Minimum absolute volume to prevent false triggers in silence
-const MIN_VOLUME = 0.02;
-
-// Rolling average smoothing factor (0.0 to 1.0; lower = smoother adaptation)
-const ROLLING_AVG_ALPHA = 0.05;
+// Disintegration Effect Parameters
+const GRID_SPACING = 6;           // Sample every 6th pixel (grid spacing)
+const PARTICLE_SIZE = 7;          // Base particle size in pixels
+const PARTICLE_SPEED = 3.5;       // Leftward drift speed (pixels per frame at 30fps)
+const FADE_TIME_MS = 2200;        // Particle lifetime / fade duration in ms
+const WAVE_DURATION_MS = 1400;    // Duration of the right-to-left wave sweep in ms
+const FADE_IN_DURATION_MS = 1000; // Duration for the reverse video fade-in in ms
 // ==============================================================
 
 (() => {
@@ -22,20 +25,237 @@ const ROLLING_AVG_ALPHA = 0.05;
   if (window.__meetSnapInjected) return;
   window.__meetSnapInjected = true;
 
-  console.log('%c[MeetSnap v1.0.2] INITIALIZED - MAIN world script active', 'background: #007acc; color: white; font-size: 13px; font-weight: bold; padding: 3px 6px; border-radius: 3px;');
+  console.log('%c[MeetSnap v1.0.4] INITIALIZED - Speech-Filtered Clap & Disintegration Active', 'background: #007acc; color: white; font-size: 13px; font-weight: bold; padding: 3px 6px; border-radius: 3px;');
 
-  // Visual state: toggles between red tint (true) and normal video (false)
-  let isRedTintActive = true;
+  // Effect state machine: 'NORMAL', 'DISINTEGRATING', 'DARK', 'FADING_IN'
+  const STATE_NORMAL = 'NORMAL';
+  const STATE_DISINTEGRATING = 'DISINTEGRATING';
+  const STATE_DARK = 'DARK';
+  const STATE_FADING_IN = 'FADING_IN';
+  let effectState = STATE_NORMAL;
+
+  // Particle data arrays (TypedArrays for 60fps performance without garbage collection pauses)
+  let particleCount = 0;
+  let pX0 = null;
+  let pY0 = null;
+  let pVx = null;
+  let pVy = null;
+  let pWobblePhase = null;
+  let pDelay = null;
+  let pR = null;
+  let pG = null;
+  let pB = null;
+  let pAsh = null;
+
+  let disintegrationStartTime = 0;
+  let fadeInStartTime = 0;
+
+  // Reusable pixel buffer for direct memory blitting
+  let disintegrateImageData = null;
+  let disintegrateBuf32 = null;
+
+  // Video element reference
+  let activeVideoElement = null;
+  let activeCanvasElement = null;
+  let activeCanvasCtx = null;
 
   // Track IDs that have already had a clap detector attached
   const attachedTrackIds = new Set();
-
-  // Persistent reference to prevent V8 garbage collection of active WebAudio nodes
   const activeDetectors = [];
 
   /**
-   * Attaches clap detection to an audio track once per track.
-   * Clones the audio track so the stream Google Meet receives remains untouched.
+   * Helper to draw a filled square block of pixels into a 32-bit pixel buffer.
+   */
+  function drawBlock(buf, w, h, cx, cy, size, color32) {
+    const half = (size >> 1);
+    const startX = cx - half;
+    const startY = cy - half;
+    const endX = startX + size;
+    const endY = startY + size;
+
+    const minX = startX < 0 ? 0 : startX;
+    const maxX = endX > w ? w : endX;
+    const minY = startY < 0 ? 0 : startY;
+    const maxY = endY > h ? h : endY;
+
+    for (let y = minY; y < maxY; y++) {
+      const rowOffset = y * w;
+      for (let x = minX; x < maxX; x++) {
+        buf[rowOffset + x] = color32;
+      }
+    }
+  }
+
+  /**
+   * Samples the current video frame on a grid and initiates the right-to-left disintegration.
+   */
+  function startDisintegration() {
+    if (!activeVideoElement || !activeCanvasElement || !activeCanvasCtx) return;
+    if (!activeVideoElement.videoWidth || !activeVideoElement.videoHeight) return;
+
+    const w = activeCanvasElement.width;
+    const h = activeCanvasElement.height;
+
+    // Offscreen canvas to capture the raw pixel frame
+    const sampleCanvas = document.createElement('canvas');
+    sampleCanvas.width = w;
+    sampleCanvas.height = h;
+    const sampleCtx = sampleCanvas.getContext('2d');
+    sampleCtx.drawImage(activeVideoElement, 0, 0, w, h);
+
+    const imgData = sampleCtx.getImageData(0, 0, w, h);
+    const data = imgData.data;
+
+    const countX = Math.ceil(w / GRID_SPACING);
+    const countY = Math.ceil(h / GRID_SPACING);
+    const totalMax = countX * countY;
+
+    // Allocate / reuse TypedArrays
+    pX0 = new Float32Array(totalMax);
+    pY0 = new Float32Array(totalMax);
+    pVx = new Float32Array(totalMax);
+    pVy = new Float32Array(totalMax);
+    pWobblePhase = new Float32Array(totalMax);
+    pDelay = new Float32Array(totalMax);
+    pR = new Uint8Array(totalMax);
+    pG = new Uint8Array(totalMax);
+    pB = new Uint8Array(totalMax);
+    pAsh = new Uint8Array(totalMax);
+
+    let idx = 0;
+    for (let y = 0; y < h; y += GRID_SPACING) {
+      for (let x = 0; x < w; x += GRID_SPACING) {
+        const pixelIdx = (y * w + x) * 4;
+        const r = data[pixelIdx];
+        const g = data[pixelIdx + 1];
+        const b = data[pixelIdx + 2];
+
+        pX0[idx] = x;
+        pY0[idx] = y;
+
+        // Leftward drift speed with natural variance
+        pVx[idx] = PARTICLE_SPEED * (0.8 + Math.random() * 0.5);
+        // Slight random vertical drift
+        pVy[idx] = (Math.random() - 0.5) * 0.9;
+        pWobblePhase[idx] = Math.random() * Math.PI * 2;
+
+        // Wave sweep delay weighted by X position (right side starts first, sweeps left)
+        const normalizedX = x / w; // 0 on left, 1 on right
+        const jitter = (Math.random() - 0.5) * 160;
+        const delay = Math.max(0, (1 - normalizedX) * WAVE_DURATION_MS + jitter);
+        pDelay[idx] = delay;
+
+        pR[idx] = r;
+        pG[idx] = g;
+        pB[idx] = b;
+
+        // Soft grey ash value
+        pAsh[idx] = Math.floor((0.299 * r + 0.587 * g + 0.114 * b) * 0.6);
+
+        idx++;
+      }
+    }
+
+    particleCount = idx;
+    disintegrationStartTime = performance.now();
+
+    // Recreate image buffer if dimensions changed
+    if (!disintegrateImageData || disintegrateImageData.width !== w || disintegrateImageData.height !== h) {
+      disintegrateImageData = activeCanvasCtx.createImageData(w, h);
+      disintegrateBuf32 = new Uint32Array(disintegrateImageData.data.buffer);
+    }
+
+    effectState = STATE_DISINTEGRATING;
+    console.log('[MeetSnap] Disintegration wave started with', particleCount, 'particles.');
+  }
+
+  /**
+   * Renders one frame of the particle disintegration effect.
+   */
+  function renderDisintegration(now) {
+    const w = activeCanvasElement.width;
+    const h = activeCanvasElement.height;
+    const elapsed = now - disintegrationStartTime;
+
+    // Fill buffer with opaque solid black (0xFF000000 in little-endian ABGR)
+    disintegrateBuf32.fill(0xFF000000);
+
+    let activeParticlesRemaining = 0;
+
+    for (let i = 0; i < particleCount; i++) {
+      const delay = pDelay[i];
+
+      // Particle waiting for wave to reach it: draw at original position and color
+      if (elapsed < delay) {
+        activeParticlesRemaining++;
+        const x = Math.round(pX0[i]);
+        const y = Math.round(pY0[i]);
+        const color32 = (255 << 24) | (pB[i] << 16) | (pG[i] << 8) | pR[i];
+        drawBlock(disintegrateBuf32, w, h, x, y, PARTICLE_SIZE, color32);
+        continue;
+      }
+
+      const lifeElapsed = elapsed - delay;
+      const progress = lifeElapsed / FADE_TIME_MS;
+
+      // Particle has completely faded away
+      if (progress >= 1.0) {
+        continue;
+      }
+
+      activeParticlesRemaining++;
+
+      // Motion: drifts LEFT with slight vertical wobble
+      const frames = lifeElapsed / (1000 / 30);
+      const x = Math.round(pX0[i] - pVx[i] * frames);
+      const y = Math.round(pY0[i] + pVy[i] * frames + Math.sin(frames * 0.15 + pWobblePhase[i]) * 3.0);
+
+      // Particle shrinks
+      const size = Math.max(1, Math.round(PARTICLE_SIZE * (1 - progress * 0.75)));
+
+      // Color fades to grey ash
+      const ashFactor = Math.min(1.0, progress * 1.4);
+      const r = pR[i] * (1 - ashFactor) + pAsh[i] * ashFactor;
+      const g = pG[i] * (1 - ashFactor) + pAsh[i] * ashFactor;
+      const b = pB[i] * (1 - ashFactor) + pAsh[i] * ashFactor;
+
+      // Opacity fades out into the dark background
+      const alpha = progress < 0.4 ? 1.0 : (1.0 - (progress - 0.4) / 0.6);
+      const finalR = Math.round(r * alpha);
+      const finalG = Math.round(g * alpha);
+      const finalB = Math.round(b * alpha);
+
+      const color32 = (255 << 24) | (finalB << 16) | (finalG << 8) | finalR;
+      drawBlock(disintegrateBuf32, w, h, x, y, size, color32);
+    }
+
+    activeCanvasCtx.putImageData(disintegrateImageData, 0, 0);
+
+    // All particles have faded: transition to blank / dark frame
+    if (activeParticlesRemaining === 0) {
+      effectState = STATE_DARK;
+      console.log('[MeetSnap] Disintegration complete. Blank/dark frame active.');
+    }
+  }
+
+  /**
+   * Called whenever a valid clap is detected.
+   */
+  function handleClap(vol) {
+    console.log('[MeetSnap] CLAP detected, volume:', vol);
+
+    if (effectState === STATE_NORMAL) {
+      console.log('[MeetSnap] Triggering disintegration effect...');
+      startDisintegration();
+    } else if (effectState === STATE_DISINTEGRATING || effectState === STATE_DARK) {
+      console.log('[MeetSnap] Reversing effect: fading video back in...');
+      fadeInStartTime = performance.now();
+      effectState = STATE_FADING_IN;
+    }
+  }
+
+  /**
+   * Attaches clap detection with speech filtering to an audio track once per track.
    */
   function attachClapDetector(audioTrack) {
     if (!audioTrack) return;
@@ -88,17 +308,20 @@ const ROLLING_AVG_ALPHA = 0.05;
       console.log('[MeetSnap] Audio detector attached, state:', ctx.state);
 
       let currentVolume = 0;
+      let currentHfRatio = 0;
       let rollingAverage = 0;
       let lastClapTime = 0;
-      const pcmData = new Float32Array(analyser.fftSize);
+      let consecutiveLoudFrames = 0;
 
-      // Sample volume every 20ms
+      const pcmData = new Float32Array(analyser.fftSize);
+      const freqData = new Uint8Array(analyser.frequencyBinCount);
+
+      // Sample audio every 20ms
       const sampleInterval = setInterval(() => {
         if (!analyser) return;
 
+        // 1. Compute RMS Volume from Time Domain Waveform
         analyser.getFloatTimeDomainData(pcmData);
-
-        // Calculate Root Mean Square (RMS) volume
         let sumSquares = 0;
         for (let i = 0; i < pcmData.length; i++) {
           const sample = pcmData[i];
@@ -107,7 +330,35 @@ const ROLLING_AVG_ALPHA = 0.05;
         const vol = Math.sqrt(sumSquares / pcmData.length);
         currentVolume = vol;
 
-        // Update short rolling average
+        // 2. Compute Spectral High-Frequency Ratio from Frequency Domain
+        analyser.getByteFrequencyData(freqData);
+
+        // Low frequencies (voice fundamentals & formants, ~90Hz - 1500Hz: bins 1..16)
+        let lowSum = 0;
+        for (let b = 1; b <= 16; b++) {
+          lowSum += freqData[b];
+        }
+        const lowAvg = lowSum / 16;
+
+        // High frequencies (percussive clap crack, ~2500Hz - 8500Hz: bins 27..90)
+        let highSum = 0;
+        for (let b = 27; b <= 90; b++) {
+          highSum += freqData[b];
+        }
+        const highAvg = highSum / 64;
+
+        // Ratio of high frequency percussive energy to low vocal energy
+        const hfRatio = highAvg / Math.max(1, lowAvg);
+        currentHfRatio = hfRatio;
+
+        // 3. Track loud duration to reject sustained speech
+        if (vol > 0.07) {
+          consecutiveLoudFrames++;
+        } else {
+          consecutiveLoudFrames = 0;
+        }
+
+        // 4. Update rolling average
         if (rollingAverage === 0) {
           rollingAverage = vol;
         } else {
@@ -117,18 +368,30 @@ const ROLLING_AVG_ALPHA = 0.05;
         const spike = vol - rollingAverage;
         const now = Date.now();
 
-        // Detect sudden volume spike exceeding THRESHOLD with COOLDOWN
-        if (spike >= THRESHOLD && vol >= MIN_VOLUME && (now - lastClapTime >= COOLDOWN)) {
+        // 5. Multi-Criteria Clap Detection:
+        // - Volume spike exceeds THRESHOLD
+        // - Absolute volume exceeds MIN_VOLUME (speech is typically < 0.08)
+        // - High frequency ratio exceeds HIGH_FREQ_RATIO (claps are rich in high-freq percussives, speech is low-freq dominant)
+        // - Transient check: consecutive loud frames <= 3 (claps last < 60ms; speech lasts 150-400ms+)
+        // - Cooldown elapsed
+        const isClap =
+          spike >= THRESHOLD &&
+          vol >= MIN_VOLUME &&
+          hfRatio >= HIGH_FREQ_RATIO &&
+          consecutiveLoudFrames <= 3 &&
+          (now - lastClapTime >= COOLDOWN);
+
+        if (isClap) {
           lastClapTime = now;
-          isRedTintActive = !isRedTintActive;
-          console.log('[MeetSnap] CLAP detected, volume:', vol);
+          console.log(`[MeetSnap] CLAP confirmed! vol=${vol.toFixed(3)} spike=${spike.toFixed(3)} hfRatio=${hfRatio.toFixed(2)}`);
+          handleClap(vol);
         }
       }, 20);
 
-      // Every 1000ms log volume and threshold
+      // Periodic diagnostic log every 1000ms
       const logInterval = setInterval(() => {
         if (ctx && ctx.state !== 'closed') {
-          console.log('[MeetSnap] volume:', currentVolume, 'threshold:', THRESHOLD);
+          console.log(`[MeetSnap] vol: ${currentVolume.toFixed(3)} (spike: ${(currentVolume - rollingAverage).toFixed(3)}, hfRatio: ${currentHfRatio.toFixed(2)}) | threshold: ${THRESHOLD}`);
         }
       }, 1000);
 
@@ -222,12 +485,15 @@ const ROLLING_AVG_ALPHA = 0.05;
     video.muted = true;
     video.playsInline = true;
     video.srcObject = realStream;
+    activeVideoElement = video;
 
     // Offscreen canvas for frame drawing and visual effect processing
     const canvas = document.createElement('canvas');
     canvas.width = 1280;
     canvas.height = 720;
     const ctx = canvas.getContext('2d');
+    activeCanvasElement = canvas;
+    activeCanvasCtx = ctx;
 
     // Initial frame fill
     ctx.fillStyle = '#000000';
@@ -235,8 +501,8 @@ const ROLLING_AVG_ALPHA = 0.05;
 
     let animId = null;
 
-    // Render loop using requestAnimationFrame
-    function renderLoop() {
+    // Render loop using requestAnimationFrame at 30/60 FPS
+    function renderLoop(now) {
       if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
         const width = video.videoWidth;
         const height = video.videoHeight;
@@ -247,13 +513,33 @@ const ROLLING_AVG_ALPHA = 0.05;
             canvas.height = height;
           }
 
-          // Draw the camera video onto the offscreen canvas
-          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-          // If red tint is active, apply overlay; otherwise normal video is displayed
-          if (isRedTintActive) {
-            ctx.fillStyle = 'rgba(255, 0, 0, 0.4)';
+          // State machine rendering
+          if (effectState === STATE_NORMAL) {
+            // Normal live video playback
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+          } else if (effectState === STATE_DISINTEGRATING) {
+            // Particle disintegration wave
+            renderDisintegration(now);
+          } else if (effectState === STATE_DARK) {
+            // Completely blank / dark frame after disintegration
+            ctx.fillStyle = '#000000';
             ctx.fillRect(0, 0, canvas.width, canvas.height);
+          } else if (effectState === STATE_FADING_IN) {
+            // Video fading smoothly back in
+            const elapsed = now - fadeInStartTime;
+            const progress = Math.min(1.0, elapsed / FADE_IN_DURATION_MS);
+
+            ctx.fillStyle = '#000000';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            ctx.globalAlpha = progress;
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            ctx.globalAlpha = 1.0;
+
+            if (progress >= 1.0) {
+              effectState = STATE_NORMAL;
+              console.log('[MeetSnap] Fade-in complete. Normal video restored.');
+            }
           }
         }
       }
