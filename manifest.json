@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "MeetSnap",
-  "version": "1.0.0",
-  "description": "Google Meet camera interception extension with red tint canvas pipeline.",
+  "version": "1.0.2",
+  "description": "Google Meet camera interception extension with red tint canvas pipeline and clap detection.",
   "content_scripts": [
     {
       "matches": [
